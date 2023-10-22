@@ -67,7 +67,7 @@ class I2PManager:
             try:
                 assert self.connect(), "No connection"
                 self.log.debug("I2P SAM port %s check ok" % config.i2p_sam)
-            except Exception, err:
+            except Exception as err:
                 self.log.debug("I2P SAM port %s check error: %s" % (config.i2p_sam, err))
                 self.enabled = False
 
@@ -84,7 +84,7 @@ class I2PManager:
                 socket.checkAPIConnection((self.sam_ip, self.sam_port))
                 self.status = u"Connected"
                 return True
-            except Exception, err:
+            except Exception as err:
                 self.status = u"Error (%s)" % err
                 self.log.error("I2P SAM connect error: %s" % Debug.formatException(err))
                 self.enabled = False
@@ -118,7 +118,7 @@ class I2PManager:
             self.status = u"OK (%s Destinations running)" % len(self.dest_conns)
             SiteManager.peer_blacklist.append((dest.base64()+".i2p", 0))
             return dest
-        except Exception, err:
+        except Exception as err:
             self.status = u"SESSION CREATE error (%s)" % err
             self.log.error("I2P SESSION CREATE error: %s" % Debug.formatException(err))
             return False
