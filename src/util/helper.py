@@ -13,6 +13,8 @@ import gevent
 
 from Config import config
 
+from i2p.datatypes import Destination
+
 
 def atomicWrite(dest, content, mode="wb"):
     try:
@@ -115,7 +117,7 @@ def shellquote(*args):
 
 
 def packPeers(peers):
-    packed_peers = {"ipv4": [], "ipv6": [], "onion": []}
+    packed_peers = {"ipv4": [], "ipv6": [], "onion": [], "i2p": []}
     for peer in peers:
         try:
             ip_type = getIpType(peer.ip)
@@ -153,6 +155,19 @@ def packOnionAddress(onion, port):
 # From 12byte format to ip, port
 def unpackOnionAddress(packed):
     return base64.b32encode(packed[0:-2]).lower().decode() + ".onion", struct.unpack("H", packed[-2:])[0]
+
+
+# Destination, port to packed (389+)-byte format
+def packI2PAddress(dest, port):
+    if not isinstance(dest, Destination):
+        dest = dest.replace(".i2p", "")
+        dest = Destination(raw=dest, b64=True)
+    return dest.serialize() + struct.pack("H", port)
+
+
+# From (389+)-byte format to Destination, port
+def unpackI2PAddress(packed):
+    return Destination(raw=packed[0:-2]).base64() + ".i2p", struct.unpack("H", packed[-2:])[0]
 
 
 # Get dir from file

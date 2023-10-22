@@ -537,6 +537,27 @@ class Site(object):
         content_json_modified = self.content_manager.contents[inner_path]["modified"]
         body = self.storage.read(inner_path)
 
+        # Do we need this part? Removed in ZeroNetX, included in I2P Patch
+        # Find out my ip and port
+        tor_manager = self.connection_server.tor_manager
+        i2p_manager = self.connection_server.i2p_manager
+        if tor_manager and tor_manager.enabled and tor_manager.start_onions:
+            my_ip = tor_manager.getOnion(self.address)
+            if my_ip:
+                my_ip += ".onion"
+            my_port = config.fileserver_port
+        elif i2p_manager and i2p_manager.enabled and i2p_manager.start_dests:
+            my_ip = i2p_manager.getDest(self.address)
+            if my_ip:
+                my_ip += ".i2p"
+            my_port = 0
+        else:
+            my_ip = config.ip_external
+            if self.connection_server.port_opened:
+                my_port = config.fileserver_port
+            else:
+                my_port = 0
+
         while 1:
             if not peers or len(published) >= limit:
                 if event_done:
@@ -849,9 +870,223 @@ class Site(object):
             peer.found(source)
             return peer
 
+
     def announce(self, *args, **kwargs):
         if self.isServing():
             self.announcer.announce(*args, **kwargs)
+
+    # Part from I2P Patch
+    # Gather peer from connected peers
+    @util.Noparallel(blocking=False)
+    def announcePex(self, query_num=2, need_num=5):
+        peers = [peer for peer in self.peers.values() if peer.connection and peer.connection.connected]  # Connected peers
+        if len(peers) == 0:  # Small number of connected peers for this site, connect to any
+            self.log.debug("Small number of peers detected...query all of peers using pex")
+            peers = self.peers.values()
+            need_num = 10
+
+        random.shuffle(peers)
+        done = 0
+        added = 0
+        for peer in peers:
+            res = peer.pex(need_num=need_num)
+            if type(res) == int:  # We have result
+                done += 1
+                added += res
+                if res:
+                    self.worker_manager.onPeers()
+                    self.updateWebsocket(peers_added=res)
+            if done == query_num:
+                break
+        self.log.debug("Queried pex from %s peers got %s new peers." % (done, added))
+
+    # Gather peers from tracker
+    # Return: Complete time or False on error
+    def announceTracker(self, tracker_protocol, tracker_address, fileserver_port=0, add_types=[], my_peer_id="", mode="start"):
+        is_i2p = ".i2p" in tracker_address
+        i2p_manager = self.connection_server.i2p_manager
+        if is_i2p and not (i2p_manager and i2p_manager.enabled):
+            return False
+
+        s = time.time()
+        if "ip4" not in add_types:
+            fileserver_port = 0
+
+        if tracker_protocol == "udp":  # Udp tracker
+            if config.disable_udp:
+                return False  # No udp supported
+            ip, port = tracker_address.split(":")
+            tracker = UdpTrackerClient(ip, int(port))
+            tracker.peer_port = fileserver_port
+            try:
+                tracker.connect()
+                tracker.poll_once()
+                tracker.announce(info_hash=hashlib.sha1(self.address).hexdigest(), num_want=50)
+                back = tracker.poll_once()
+                peers = back["response"]["peers"]
+            except Exception, err:
+                return False
+
+        elif tracker_protocol == "http":  # Http tracker
+            params = {
+                'info_hash': hashlib.sha1(self.address).digest(),
+                'peer_id': my_peer_id, 'port': fileserver_port,
+                'uploaded': 0, 'downloaded': 0, 'left': 0, 'compact': 1, 'numwant': 30,
+                'event': 'started'
+            }
+            if is_i2p:
+                params['ip'] = i2p_manager.getDest(self.address).base64()
+            req = None
+            try:
+                url = "http://" + tracker_address + "?" + urllib.urlencode(params)
+                timeout = 60 if is_i2p else 30
+                # Load url
+                with gevent.Timeout(timeout, False):  # Make sure of timeout
+                    if is_i2p:
+                        req = i2p_manager.urlopen(self.address, url, timeout=50)
+                    else:
+                        req = urllib2.urlopen(url, timeout=25)
+                    response = req.read()
+                    req.fp._sock.recv = None  # Hacky avoidance of memory leak for older python versions
+                    req.close()
+                    req = None
+                if not response:
+                    self.log.debug("Http tracker %s response error" % url)
+                    return False
+                # Decode peers
+                peer_data = bencode.decode(response)["peers"]
+                response = None
+                peers = []
+                if isinstance(peer_data, str):
+                    # Compact response
+                    peer_length = 32 if is_i2p else 6
+                    peer_count = len(peer_data) / peer_length
+                    for peer_offset in xrange(peer_count):
+                        off = peer_length * peer_offset
+                        peer = peer_data[off:off + peer_length]
+                        if is_i2p:
+                            # TODO measure whether non-compact is faster than compact+lookup
+                            try:
+                                dest = i2p_manager.lookup(peer+".b32.i2p")
+                                peers.append({"addr": dest.base64()+".i2p", "port": 6881})
+                            except Exception:
+                                pass
+                        else:
+                            addr, port = struct.unpack('!LH', peer)
+                            peers.append({"addr": socket.inet_ntoa(struct.pack('!L', addr)), "port": port})
+                else:
+                    # Non-compact response
+                    for peer in peer_data:
+                        if is_i2p:
+                            peers.append({"addr": peer["ip"]+".i2p", "port": peer["port"]})
+                        else:
+                            peers.append({"addr": peer["ip"], "port": peer["port"]})
+            except Exception, err:
+                self.log.debug("Http tracker %s error: %s" % (url, err))
+                if req:
+                    req.close()
+                    req = None
+                return False
+        else:
+            peers = []
+
+        # Adding peers
+        added = 0
+        for peer in peers:
+            if not peer["port"]:
+                continue  # Dont add peers with port 0
+            if self.addPeer(peer["addr"], peer["port"]):
+                added += 1
+        if added:
+            self.worker_manager.onPeers()
+            self.updateWebsocket(peers_added=added)
+            self.log.debug("Found %s peers, new: %s, total: %s" % (len(peers), added, len(self.peers)))
+        return time.time() - s
+
+    # Add myself and get other peers from tracker
+    def announce(self, force=False, mode="start", pex=True):
+        if time.time() < self.time_announce + 30 and not force:
+            return  # No reannouncing within 30 secs
+        self.time_announce = time.time()
+
+        trackers = config.trackers
+        # Filter trackers based on supported networks
+        if config.disable_udp:
+            trackers = [tracker for tracker in trackers if not tracker.startswith("udp://")]
+        if self.connection_server and not self.connection_server.tor_manager.enabled:
+            trackers = [tracker for tracker in trackers if ".onion" not in tracker]
+        if self.connection_server and not self.connection_server.i2p_manager.enabled:
+            trackers = [tracker for tracker in trackers if ".i2p" not in tracker]
+
+        if mode == "update" or mode == "more":  # Only announce on one tracker, increment the queried tracker id
+            self.last_tracker_id += 1
+            self.last_tracker_id = self.last_tracker_id % len(trackers)
+            trackers = [trackers[self.last_tracker_id]]  # We only going to use this one
+
+        errors = []
+        slow = []
+        add_types = []
+        if self.connection_server:
+            my_peer_id = self.connection_server.peer_id
+
+            # Type of addresses they can reach me
+            if self.connection_server.port_opened:
+                add_types.append("ip4")
+            if self.connection_server.tor_manager.enabled and self.connection_server.tor_manager.start_onions:
+                add_types.append("onion")
+            if self.connection_server.i2p_manager.enabled and self.connection_server.i2p_manager.start_dests:
+                add_types.append("i2p")
+        else:
+            my_peer_id = ""
+
+        s = time.time()
+        announced = 0
+        threads = []
+        fileserver_port = config.fileserver_port
+
+        for tracker in trackers:  # Start announce threads
+            tracker_protocol, tracker_address = tracker.split("://")
+            thread = gevent.spawn(
+                self.announceTracker, tracker_protocol, tracker_address, fileserver_port, add_types, my_peer_id, mode
+            )
+            threads.append(thread)
+            thread.tracker_address = tracker_address
+            thread.tracker_protocol = tracker_protocol
+
+        gevent.joinall(threads, timeout=10)  # Wait for announce finish
+
+        for thread in threads:
+            if thread.value:
+                if thread.value > 1:
+                    slow.append("%.2fs %s://%s" % (thread.value, thread.tracker_protocol, thread.tracker_address))
+                announced += 1
+            else:
+                if thread.ready():
+                    errors.append("%s://%s" % (thread.tracker_protocol, thread.tracker_address))
+                else:  # Still running
+                    slow.append("10s+ %s://%s" % (thread.tracker_protocol, thread.tracker_address))
+
+        # Save peers num
+        self.settings["peers"] = len(self.peers)
+
+        if len(errors) < len(threads):  # Less errors than total tracker nums
+            self.log.debug(
+                "Announced types %s in mode %s to %s trackers in %.3fs, errors: %s, slow: %s" %
+                (add_types, mode, announced, time.time() - s, errors, slow)
+            )
+        else:
+            if mode != "update":
+                self.log.error("Announce to %s trackers in %.3fs, failed" % (announced, time.time() - s))
+
+        if pex:
+            if not [peer for peer in self.peers.values() if peer.connection and peer.connection.connected]:
+                # If no connected peer yet then wait for connections
+                gevent.spawn_later(3, self.announcePex, need_num=10)  # Spawn 3 secs later
+            else:  # Else announce immediately
+                if mode == "more":  # Need more peers
+                    self.announcePex(need_num=10)
+                else:
+                    self.announcePex()
 
     # Keep connections to get the updates
     def needConnections(self, num=None, check_site_on_reconnect=False):
