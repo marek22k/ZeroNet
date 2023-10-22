@@ -177,8 +177,8 @@ class ConnectionServer(object):
 
     def getConnection(self, ip=None, port=None, peer_id=None, create=True, site=None, is_tracker_connection=False):
         ip_type = helper.getIpType(ip)
-        has_per_site_onion = ((ip.endswith(".onion") or self.port_opened.get("onion", None) == False) and self.tor_manager.start_onions) or \
-                              (ip.endswith(".i2p") or self.port_opened.get("i2p", None) == False) and self.i2p_manager.start_dests)) and site
+        has_per_site_onion = (((ip.endswith(".onion") or self.port_opened.get("onion", None) == False) and self.tor_manager.start_onions) or \
+                              ((ip.endswith(".i2p") or self.port_opened.get("i2p", None) == False) and self.i2p_manager.start_dests)) and site
         if has_per_site_onion:  # Site-unique connection for Tor or I2P
             if ip.endswith(".onion"):
                 site_onion = self.tor_manager.getOnion(site.address)
